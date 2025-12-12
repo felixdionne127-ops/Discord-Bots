@@ -33,12 +33,12 @@ class HuntManager:
         self.load_data()
     
     def load_data(self):
-        if os.path.exists('hunts.json'):
-            with open('hunts.json', 'r') as f:
+        if os.path.exists('/app/data/hunts.json'):
+            with open('/app/data/hunts.json', 'r') as f:
                 self.weekly_hunts = json.load(f)
     
     def save_data(self):
-        with open('hunts.json', 'w') as f:
+        with open('/app/data/hunts.json', 'w') as f:
             json.dump(self.weekly_hunts, f, indent=4)
     
     def create_weekly_hunts(self, channel_id):
