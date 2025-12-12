@@ -628,4 +628,4 @@ async def createweeklyhunts(ctx):
     await ctx.send("✅ Weekly hunts created!", delete_after=5)
 
 # Run the bot
-bot.run(os.getenv('BOT_TOKEN')
+bot.run(os.getenv('BOT_TOKEN'))
