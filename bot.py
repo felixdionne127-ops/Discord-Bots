@@ -496,7 +496,7 @@ class ChangeRoleButton(discord.ui.Button):
 
 class RoleChangeView(discord.ui.View):
     def __init__(self, hunt_index, channel_id):
-        super().__init__(timeout=180)
+        super().__init__(timeout=600)  # 10 minutes instead of 180 seconds
         self.hunt_index = hunt_index
         self.channel_id = channel_id
         
@@ -595,7 +595,7 @@ class LeaveButton(discord.ui.Button):
 
 class PartySelectView(discord.ui.View):
     def __init__(self, hunt_index, role, user, channel_id):
-        super().__init__(timeout=180)
+        super().__init__(timeout=600)  # 10 minutes instead of 180 seconds
         self.hunt_index = hunt_index
         self.role = role
         self.user = user
@@ -815,4 +815,3 @@ async def createweeklyhunts(ctx):
     await ctx.message.delete()
 
 bot.run(os.getenv("BOT_TOKEN"))
-
