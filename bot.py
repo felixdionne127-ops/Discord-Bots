@@ -1,5 +1,4 @@
 import discord
-# Triggering redeploy
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 import pytz
@@ -34,8 +33,15 @@ class HuntManager:
     
     def load_data(self):
         if os.path.exists('/app/data/hunts.json'):
-            with open('/app/data/hunts.json', 'r') as f:
-                self.weekly_hunts = json.load(f)
+            try:
+                with open('/app/data/hunts.json', 'r') as f:
+                    self.weekly_hunts = json.load(f)
+            except json.JSONDecodeError:
+                print("hunts.json is corrupted or empty — resetting data")
+                self.weekly_hunts = {}
+            except Exception as e:
+                print(f"Error loading hunts.json: {e} — resetting data")
+                self.weekly_hunts = {}
     
     def save_data(self):
         with open('/app/data/hunts.json', 'w') as f:
@@ -43,6 +49,10 @@ class HuntManager:
     
     def create_weekly_hunts(self, channel_id):
         hunt_id = str(channel_id)
+        
+        # 🔒 Prevent duplicate weekly hunts for the same channel
+        self.weekly_hunts.pop(hunt_id, None)
+        
         now = datetime.now(TIMEZONE)
         
         hunts = []
@@ -62,7 +72,7 @@ class HuntManager:
             hunts.append({
                 'hunt_time': hunt_time.isoformat(),
                 'label': schedule['label'],
-                'signed_up': [],  # List of users who signed up
+                'signed_up': [],
                 'tentative': [],
                 'parties': {
                     '1': {'tank': None, 'support': None, 'dps': []},
@@ -73,13 +83,13 @@ class HuntManager:
                     '6': {'tank': None, 'support': None, 'dps': []},
                     '7': {'tank': None, 'support': None, 'dps': []},
                     '8': {'tank': None, 'support': None, 'dps': []}
-                }
+                },
+                'message_id': None
             })
         
         self.weekly_hunts[hunt_id] = {
             'channel_id': channel_id,
             'hunts': hunts,
-            'message_id': None,
             'created_at': now.isoformat()
         }
         self.save_data()
@@ -88,6 +98,53 @@ class HuntManager:
     def get_weekly_hunts(self, channel_id):
         return self.weekly_hunts.get(str(channel_id))
     
+    def get_hunt_by_message(self, message_id):
+        for channel_id, weekly in self.weekly_hunts.items():
+            for idx, hunt in enumerate(weekly['hunts']):
+                if hunt.get('message_id') == message_id:
+                    return channel_id, idx, hunt
+        return None, None, None
+    
+    def get_user_party(self, channel_id, hunt_index, user_id):
+        """Get which party and role a user is currently in"""
+        weekly = self.get_weekly_hunts(channel_id)
+        if not weekly or hunt_index >= len(weekly['hunts']):
+            return None, None
+        
+        hunt = weekly['hunts'][hunt_index]
+        for party_num, party in hunt['parties'].items():
+            if party['tank'] and party['tank']['id'] == user_id:
+                return party_num, 'tank'
+            if party['support'] and party['support']['id'] == user_id:
+                return party_num, 'support'
+            for dps in party['dps']:
+                if dps['id'] == user_id:
+                    return party_num, 'dps'
+        return None, None
+    
+    def change_role(self, channel_id, hunt_index, user_id, username, new_role):
+        """Change a user's signed up role"""
+        weekly = self.get_weekly_hunts(channel_id)
+        if not weekly or hunt_index >= len(weekly['hunts']):
+            return False, "Invalid hunt selection."
+        
+        hunt = weekly['hunts'][hunt_index]
+        
+        # Check if user is signed up
+        user_signup = next((u for u in hunt['signed_up'] if u['id'] == user_id), None)
+        if not user_signup:
+            return False, "You must be signed up first to change roles."
+        
+        # Remove from current party
+        self.remove_user_from_hunt(hunt, user_id)
+        
+        # Update role in signed_up list
+        user_data = {'id': user_id, 'name': username, 'role': new_role}
+        hunt['signed_up'].append(user_data)
+        
+        self.save_data()
+        return True, f"Role changed to {new_role}! Please select your party again."
+    
     def signup(self, channel_id, hunt_index, user_id, username, role, is_replacement=False):
         weekly = self.get_weekly_hunts(channel_id)
         if not weekly or hunt_index >= len(weekly['hunts']):
@@ -95,28 +152,24 @@ class HuntManager:
         
         hunt = weekly['hunts'][hunt_index]
         
-        # If not replacement, remove user from all lists in this specific hunt
         if not is_replacement:
             self.remove_user_from_hunt(hunt, user_id)
         
         user_data = {'id': user_id, 'name': username, 'role': role}
         
-        # If replacement, try to auto-assign to a party that needs this role
         if is_replacement:
             assigned = False
             for party_num in range(1, 9):
                 party = hunt['parties'][str(party_num)]
-                # Check if party has at least 1 person and is missing this role
                 party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
                 
-                if party_count > 0:  # Party has at least one person
-                    # Check if user is already in THIS specific party
+                if party_count > 0:
                     user_in_this_party = (party['tank'] and party['tank']['id'] == user_id) or \
                                          (party['support'] and party['support']['id'] == user_id) or \
                                          any(d['id'] == user_id for d in party['dps'])
                     
                     if user_in_this_party:
-                        continue  # Skip this party, user is already here
+                        continue
                     
                     if role == 'tank' and not party['tank']:
                         party['tank'] = {'id': user_id, 'name': username}
@@ -137,7 +190,6 @@ class HuntManager:
             if not assigned:
                 return False, f"No parties currently need a {role} replacement."
         else:
-            # Normal signup
             hunt['signed_up'].append(user_data)
         
         self.save_data()
@@ -154,7 +206,7 @@ class HuntManager:
         self.save_data()
         return True, f"Added to tentative for {hunt['label']}!"
     
-    def join_party(self, channel_id, hunt_index, party_number, user_id, username, role, user_roles):
+    def join_party(self, channel_id, hunt_index, party_number, user_id, username, user_roles):
         weekly = self.get_weekly_hunts(channel_id)
         if not weekly or hunt_index >= len(weekly['hunts']):
             return False, "Invalid hunt selection."
@@ -165,18 +217,17 @@ class HuntManager:
         if not party:
             return False, "Invalid party number."
         
-        # Check if user is signed up first
         user_signup = next((u for u in hunt['signed_up'] if u['id'] == user_id), None)
         if not user_signup:
             return False, "You must sign up for the hunt first before joining a party!"
         
-        # Check priority roles for Party 1 and 2
+        role = user_signup['role']
+        
         if party_number in [1, 2]:
             has_priority = any(role_name in PRIORITY_ROLES for role_name in user_roles)
             if not has_priority:
                 return False, f"Party {party_number} is reserved for @Frontrunner, @Envoy, @Strategist, @GM, @Quartermaster, @Administrator, and @Vice Master members only."
         
-        # Remove user from all parties in this hunt
         for p in hunt['parties'].values():
             if p['tank'] and p['tank']['id'] == user_id:
                 p['tank'] = None
@@ -186,7 +237,6 @@ class HuntManager:
         
         user_data = {'id': user_id, 'name': username}
         
-        # Add to party based on role
         if role == 'tank':
             if party['tank']:
                 return False, f"Party {party_number} already has a tank."
@@ -210,13 +260,20 @@ class HuntManager:
         
         hunt = weekly['hunts'][hunt_index]
         
-        # Remove from all parties
+        found = False
         for p in hunt['parties'].values():
             if p['tank'] and p['tank']['id'] == user_id:
                 p['tank'] = None
+                found = True
             if p['support'] and p['support']['id'] == user_id:
                 p['support'] = None
+                found = True
             p['dps'] = [d for d in p['dps'] if d['id'] != user_id]
+            if found:
+                break
+        
+        if not found:
+            return False, "You are not currently in a party."
         
         self.save_data()
         return True, "Left your current party!"
@@ -225,7 +282,6 @@ class HuntManager:
         hunt['signed_up'] = [u for u in hunt['signed_up'] if u['id'] != user_id]
         hunt['tentative'] = [u for u in hunt['tentative'] if u['id'] != user_id]
         
-        # Also remove from all parties
         for p in hunt['parties'].values():
             if p['tank'] and p['tank']['id'] == user_id:
                 p['tank'] = None
@@ -245,291 +301,345 @@ class HuntManager:
 
 hunt_manager = HuntManager()
 
-def create_weekly_embed(weekly_data):
+def create_hunt_embed(hunt, hunt_index):
     now = datetime.now(TIMEZONE)
+    hunt_time = datetime.fromisoformat(hunt['hunt_time'])
+    time_diff = hunt_time - now
     
-    description = "**Guild Hunt Signups for This Week!**\n"
-    description += "Sign up first, then choose your party (5 players per party: 1 Tank, 1 Support, 3 DPS)\n"
-    description += "*Parties 1 & 2 are reserved for @Frontrunner, @Envoy, @Strategist, @GM, @Quartermaster, @Administrator, and @Vice Master*\n\n"
-    
-    for idx, hunt in enumerate(weekly_data['hunts']):
-        hunt_time = datetime.fromisoformat(hunt['hunt_time'])
-        time_diff = hunt_time - now
+    if time_diff.total_seconds() > 0:
+        days = time_diff.days
+        hours = time_diff.seconds // 3600
+        minutes = (time_diff.seconds % 3600) // 60
         
-        # Calculate time remaining
-        if time_diff.total_seconds() > 0:
-            days = time_diff.days
-            hours = time_diff.seconds // 3600
-            minutes = (time_diff.seconds % 3600) // 60
-            
-            if days > 0:
-                time_remaining = f"{days}d {hours}h"
-            elif hours > 0:
-                time_remaining = f"{hours}h {minutes}m"
-            else:
-                time_remaining = f"{minutes}m"
-            time_str = f"⏰ {time_remaining}"
+        if days > 0:
+            time_remaining = f"{days}d {hours}h"
+        elif hours > 0:
+            time_remaining = f"{hours}h {minutes}m"
         else:
-            time_str = "✅ Completed"
+            time_remaining = f"{minutes}m"
+        time_str = f"⏰ {time_remaining}"
+    else:
+        time_str = "✅ Completed"
+    
+    total_signups = len(hunt['signed_up'])
+    timestamp = int(hunt_time.timestamp())
+    
+    description = f"**{hunt['label']}**\n"
+    description += f"📅 <t:{timestamp}:F> (shows your local time)\n"
+    description += f"{time_str} | Signed up: **{total_signups}**\n\n"
+    description += "*Parties 1 & 2 reserved for leadership roles 👑*\n"
+    description += "*Sign up with your role, then choose your party*\n\n"
+    
+    for party_num in range(1, 9):
+        party = hunt['parties'][str(party_num)]
+        party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
         
-        total_signups = len(hunt['signed_up'])
-        timestamp = int(hunt_time.timestamp())
-        
-        description += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        description += f"**{hunt['label']}**\n"
-        description += f"📅 <t:{timestamp}:F> (shows your local time)\n"
-        description += f"{time_str} | Signed up: **{total_signups}**\n\n"
-        
-        # Show parties
-        for party_num in range(1, 9):
-            party = hunt['parties'][str(party_num)]
+        if party_count == 0:
+            tank_name = "Empty"
+            support_name = "Empty"
+            dps_names = "Empty"
+        else:
+            tank_name = party['tank']['name'] if party['tank'] else "⚠️ Need a tank to fill in"
+            support_name = party['support']['name'] if party['support'] else "⚠️ Need a support to fill in"
             
-            # Calculate party status
-            party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
-            
-            # Determine display text for each role
-            if party_count == 0:
-                # Empty party - show "Empty" for all
-                tank_name = "Empty"
-                support_name = "Empty"
-                dps_names = "Empty"
+            if len(party['dps']) == 0:
+                dps_names = "⚠️ Need DPS to fill in"
+            elif len(party['dps']) < 3:
+                dps_names = ', '.join([d['name'] for d in party['dps']]) + " (Need more DPS)"
             else:
-                # Party has at least one person - show "Need X to fill in" for missing roles
-                tank_name = party['tank']['name'] if party['tank'] else "Need a tank to fill in"
-                support_name = party['support']['name'] if party['support'] else "Need a support to fill in"
-                
-                if len(party['dps']) == 0:
-                    dps_names = "Need DPS to fill in"
-                elif len(party['dps']) < 3:
-                    dps_names = ', '.join([d['name'] for d in party['dps']]) + " (Need more DPS)"
-                else:
-                    dps_names = ', '.join([d['name'] for d in party['dps']])
-            
-            dps_count = len(party['dps'])
-            
-            party_label = f"**Party {party_num}** ({party_count}/5)"
-            if party_num in [1, 2]:
-                party_label += " 👑"
-            
-            description += f"{party_label}\n"
-            description += f"🛡️ Tank: {tank_name} | 💚 Support: {support_name} | ⚔️ DPS ({dps_count}/3): {dps_names}\n"
+                dps_names = ', '.join([d['name'] for d in party['dps']])
         
-        # Not in party yet
-        not_in_party = []
-        for user in hunt['signed_up']:
-            user_id = user['id']
-            in_party = False
-            for p in hunt['parties'].values():
-                if (p['tank'] and p['tank']['id'] == user_id) or \
-                   (p['support'] and p['support']['id'] == user_id) or \
-                   any(d['id'] == user_id for d in p['dps']):
-                    in_party = True
-                    break
-            if not in_party:
-                not_in_party.append(f"{user['name']} ({user['role']})")
+        dps_count = len(party['dps'])
+        party_label = f"## Party {party_num} ({party_count}/5)"
+        if party_num in [1, 2]:
+            party_label += " 👑"
         
-        if not_in_party:
-            description += f"\n**Signed up but not in party:** {', '.join(not_in_party)}\n"
+        description += f"{party_label}\n"
         
-        # Tentative
-        if hunt['tentative']:
-            tent_names = ', '.join([u['name'] for u in hunt['tentative']])
-            description += f"❓ **Tentative:** {tent_names}\n"
+        # Tank
+        description += f"🛡️ **Tank:**\n"
+        if party_count == 0 or not party['tank']:
+            if party_count == 0:
+                description += f"• Empty\n"
+            else:
+                description += f"• ⚠️ Need a tank to fill in\n"
+        else:
+            description += f"• {party['tank']['name']}\n"
+        
+        # Support
+        description += f"💚 **Support:**\n"
+        if party_count == 0 or not party['support']:
+            if party_count == 0:
+                description += f"• Empty\n"
+            else:
+                description += f"• ⚠️ Need a support to fill in\n"
+        else:
+            description += f"• {party['support']['name']}\n"
+        
+        # DPS
+        description += f"⚔️ **DPS ({dps_count}/3):**\n"
+        if party_count == 0:
+            description += f"• Empty\n"
+        elif len(party['dps']) == 0:
+            description += f"• ⚠️ Need DPS to fill in\n"
+        else:
+            dps_list = ', '.join([d['name'] for d in party['dps']])
+            description += f"• {dps_list}"
+            if len(party['dps']) < 3:
+                description += " (Need more DPS)"
+            description += "\n"
         
         description += "\n"
     
+    not_in_party = []
+    for user in hunt['signed_up']:
+        user_id = user['id']
+        in_party = False
+        for p in hunt['parties'].values():
+            if (p['tank'] and p['tank']['id'] == user_id) or \
+               (p['support'] and p['support']['id'] == user_id) or \
+               any(d['id'] == user_id for d in p['dps']):
+                in_party = True
+                break
+        if not in_party:
+            not_in_party.append(f"{user['name']} ({user['role']})")
+    
+    if not_in_party:
+        description += f"**📝 Signed up but not in party:** {', '.join(not_in_party)}\n"
+    
+    if hunt['tentative']:
+        tent_names = ', '.join([u['name'] for u in hunt['tentative']])
+        description += f"**❓ Tentative:** {tent_names}\n"
+    
     embed = discord.Embed(
-        title="🏹 Guild Hunt Signups 🏹",
+        title=f"🏹 Guild Hunt - {hunt['label']} 🏹",
         description=description,
         color=discord.Color.green()
     )
     
-    embed.set_footer(text="Times shown in your local timezone • Select a hunt day first, then choose your role!")
+    embed.set_footer(text="Use the buttons below to sign up!")
     return embed
 
-class HuntDaySelect(discord.ui.Select):
-    def __init__(self, weekly_data):
-        options = []
-        for idx, hunt in enumerate(weekly_data['hunts']):
-            total = len(hunt['signed_up'])
-            options.append(
-                discord.SelectOption(
-                    label=hunt['label'],
-                    description=f"Signups: {total}",
-                    value=str(idx),
-                    emoji="📅"
-                )
-            )
-        
-        super().__init__(
-            placeholder="Select a hunt day...",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="hunt_day_select"
-        )
-    
-    async def callback(self, interaction: discord.Interaction):
-        hunt_index = int(self.values[0])
-        view = HuntRoleView(hunt_index)
-        await interaction.response.send_message(
-            f"Selected hunt day. Now choose your action:",
-            view=view,
-            ephemeral=True
-        )
-
-class HuntDayView(discord.ui.View):
-    def __init__(self, weekly_data):
-        super().__init__(timeout=None)
-        self.add_item(HuntDaySelect(weekly_data))
-
-class HuntRoleView(discord.ui.View):
+class HuntSignupView(discord.ui.View):
     def __init__(self, hunt_index):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
+        self.hunt_index = hunt_index
+        custom_id_base = f"hunt_{hunt_index}"
+        
+        self.add_item(HuntButton(label="Tank", style=discord.ButtonStyle.primary, emoji="🛡️", 
+                                 custom_id=f"{custom_id_base}_tank", role="tank", hunt_index=hunt_index, row=0))
+        self.add_item(HuntButton(label="Support", style=discord.ButtonStyle.success, emoji="💚", 
+                                 custom_id=f"{custom_id_base}_support", role="support", hunt_index=hunt_index, row=0))
+        self.add_item(HuntButton(label="DPS", style=discord.ButtonStyle.danger, emoji="⚔️", 
+                                 custom_id=f"{custom_id_base}_dps", role="dps", hunt_index=hunt_index, row=0))
+        self.add_item(ChangeRoleButton(custom_id=f"{custom_id_base}_change", hunt_index=hunt_index, row=0))
+        
+        self.add_item(ReplacementButton(label="Replacement Tank", style=discord.ButtonStyle.primary, emoji="🔄",
+                                       custom_id=f"{custom_id_base}_rep_tank", role="tank", hunt_index=hunt_index, row=1))
+        self.add_item(ReplacementButton(label="Replacement Support", style=discord.ButtonStyle.success, emoji="🔄",
+                                       custom_id=f"{custom_id_base}_rep_support", role="support", hunt_index=hunt_index, row=1))
+        self.add_item(ReplacementButton(label="Replacement DPS", style=discord.ButtonStyle.danger, emoji="🔄",
+                                       custom_id=f"{custom_id_base}_rep_dps", role="dps", hunt_index=hunt_index, row=1))
+        
+        self.add_item(TentativeButton(custom_id=f"{custom_id_base}_tentative", hunt_index=hunt_index, row=2))
+        self.add_item(LeaveButton(custom_id=f"{custom_id_base}_leave", hunt_index=hunt_index, row=2))
+
+class HuntButton(discord.ui.Button):
+    def __init__(self, label, style, emoji, custom_id, role, hunt_index, row):
+        super().__init__(label=label, style=style, emoji=emoji, custom_id=custom_id, row=row)
+        self.role = role
         self.hunt_index = hunt_index
     
-    @discord.ui.button(label="Tank", style=discord.ButtonStyle.primary, emoji="🛡️", row=0)
-    async def tank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
+        channel_id, _, _ = hunt_manager.get_hunt_by_message(interaction.message.id)
+        if not channel_id:
+            await interaction.response.send_message("Error: Hunt not found.", ephemeral=True)
+            return
+        
         success, message = hunt_manager.signup(
-            interaction.channel.id,
+            int(channel_id),
             self.hunt_index,
             interaction.user.id,
             interaction.user.display_name,
-            'tank',
+            self.role,
             is_replacement=False
         )
         
         if success:
-            # Show party selection
-            view = PartySelectView(self.hunt_index, 'tank', interaction.user)
-            await interaction.response.send_message(message + "\nSelect your party:", view=view, ephemeral=True)
-            await update_weekly_message(interaction.channel.id)
+            # Check current party status
+            party_num, party_role = hunt_manager.get_user_party(int(channel_id), self.hunt_index, interaction.user.id)
+            status_msg = message
+            if party_num:
+                status_msg += f"\n\n**Current Status:** You are in Party {party_num} as {party_role}."
+            else:
+                status_msg += "\n\n**Current Status:** Not in a party yet."
+            
+            view = PartySelectView(self.hunt_index, self.role, interaction.user, int(channel_id))
+            await interaction.response.send_message(status_msg + "\nSelect your party:", view=view, ephemeral=True)
+            await update_hunt_message(int(channel_id), self.hunt_index)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+
+class ChangeRoleButton(discord.ui.Button):
+    def __init__(self, custom_id, hunt_index, row):
+        super().__init__(label="Change Role", style=discord.ButtonStyle.secondary, emoji="🔄", custom_id=custom_id, row=row)
+        self.hunt_index = hunt_index
     
-    @discord.ui.button(label="Support", style=discord.ButtonStyle.success, emoji="💚", row=0)
-    async def support_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        success, message = hunt_manager.signup(
-            interaction.channel.id,
+    async def callback(self, interaction: discord.Interaction):
+        channel_id, _, _ = hunt_manager.get_hunt_by_message(interaction.message.id)
+        if not channel_id:
+            await interaction.response.send_message("Error: Hunt not found.", ephemeral=True)
+            return
+        
+        view = RoleChangeView(self.hunt_index, int(channel_id))
+        await interaction.response.send_message("Select your new role:", view=view, ephemeral=True)
+
+class RoleChangeView(discord.ui.View):
+    def __init__(self, hunt_index, channel_id):
+        super().__init__(timeout=180)
+        self.hunt_index = hunt_index
+        self.channel_id = channel_id
+        
+        select = discord.ui.Select(
+            placeholder="Choose your new role...",
+            options=[
+                discord.SelectOption(label="Tank", value="tank", emoji="🛡️"),
+                discord.SelectOption(label="Support", value="support", emoji="💚"),
+                discord.SelectOption(label="DPS", value="dps", emoji="⚔️")
+            ]
+        )
+        select.callback = self.role_select_callback
+        self.add_item(select)
+    
+    async def role_select_callback(self, interaction: discord.Interaction):
+        new_role = interaction.data['values'][0]
+        success, message = hunt_manager.change_role(
+            self.channel_id,
             self.hunt_index,
             interaction.user.id,
             interaction.user.display_name,
-            'support',
-            is_replacement=False
+            new_role
         )
         
         if success:
-            view = PartySelectView(self.hunt_index, 'support', interaction.user)
+            view = PartySelectView(self.hunt_index, new_role, interaction.user, self.channel_id)
             await interaction.response.send_message(message + "\nSelect your party:", view=view, ephemeral=True)
-            await update_weekly_message(interaction.channel.id)
+            await update_hunt_message(self.channel_id, self.hunt_index)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+
+class ReplacementButton(discord.ui.Button):
+    def __init__(self, label, style, emoji, custom_id, role, hunt_index, row):
+        super().__init__(label=label, style=style, emoji=emoji, custom_id=custom_id, row=row)
+        self.role = role
+        self.hunt_index = hunt_index
     
-    @discord.ui.button(label="DPS", style=discord.ButtonStyle.danger, emoji="⚔️", row=0)
-    async def dps_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        success, message = hunt_manager.signup(
-            interaction.channel.id,
-            self.hunt_index,
-            interaction.user.id,
-            interaction.user.display_name,
-            'dps',
-            is_replacement=False
-        )
+    async def callback(self, interaction: discord.Interaction):
+        channel_id, _, _ = hunt_manager.get_hunt_by_message(interaction.message.id)
+        if not channel_id:
+            await interaction.response.send_message("Error: Hunt not found.", ephemeral=True)
+            return
         
-        if success:
-            view = PartySelectView(self.hunt_index, 'dps', interaction.user)
-            await interaction.response.send_message(message + "\nSelect your party:", view=view, ephemeral=True)
-            await update_weekly_message(interaction.channel.id)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-    
-    @discord.ui.button(label="Replacement Tank", style=discord.ButtonStyle.primary, emoji="🔄", row=1)
-    async def replacement_tank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         success, message = hunt_manager.signup(
-            interaction.channel.id,
+            int(channel_id),
             self.hunt_index,
             interaction.user.id,
             interaction.user.display_name,
-            'tank',
+            self.role,
             is_replacement=True
         )
         await interaction.response.send_message(message, ephemeral=True)
         if success:
-            await update_weekly_message(interaction.channel.id)
+            await update_hunt_message(int(channel_id), self.hunt_index)
+
+class TentativeButton(discord.ui.Button):
+    def __init__(self, custom_id, hunt_index, row):
+        super().__init__(label="Tentative", style=discord.ButtonStyle.secondary, emoji="❓", custom_id=custom_id, row=row)
+        self.hunt_index = hunt_index
     
-    @discord.ui.button(label="Replacement Support", style=discord.ButtonStyle.success, emoji="🔄", row=1)
-    async def replacement_support_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        success, message = hunt_manager.signup(
-            interaction.channel.id,
-            self.hunt_index,
-            interaction.user.id,
-            interaction.user.display_name,
-            'support',
-            is_replacement=True
-        )
-        await interaction.response.send_message(message, ephemeral=True)
-        if success:
-            await update_weekly_message(interaction.channel.id)
-    
-    @discord.ui.button(label="Replacement DPS", style=discord.ButtonStyle.danger, emoji="🔄", row=1)
-    async def replacement_dps_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        success, message = hunt_manager.signup(
-            interaction.channel.id,
-            self.hunt_index,
-            interaction.user.id,
-            interaction.user.display_name,
-            'dps',
-            is_replacement=True
-        )
-        await interaction.response.send_message(message, ephemeral=True)
-        if success:
-            await update_weekly_message(interaction.channel.id)
-    
-    @discord.ui.button(label="Tentative", style=discord.ButtonStyle.secondary, emoji="❓", row=2)
-    async def tentative_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
+        channel_id, _, _ = hunt_manager.get_hunt_by_message(interaction.message.id)
+        if not channel_id:
+            await interaction.response.send_message("Error: Hunt not found.", ephemeral=True)
+            return
+        
         success, message = hunt_manager.signup_tentative(
-            interaction.channel.id,
+            int(channel_id),
             self.hunt_index,
             interaction.user.id,
             interaction.user.display_name
         )
         await interaction.response.send_message(message, ephemeral=True)
         if success:
-            await update_weekly_message(interaction.channel.id)
+            await update_hunt_message(int(channel_id), self.hunt_index)
+
+class LeaveButton(discord.ui.Button):
+    def __init__(self, custom_id, hunt_index, row):
+        super().__init__(label="Leave Hunt", style=discord.ButtonStyle.secondary, emoji="❌", custom_id=custom_id, row=row)
+        self.hunt_index = hunt_index
     
-    @discord.ui.button(label="Leave Hunt", style=discord.ButtonStyle.secondary, emoji="❌", row=2)
-    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
+        channel_id, _, _ = hunt_manager.get_hunt_by_message(interaction.message.id)
+        if not channel_id:
+            await interaction.response.send_message("Error: Hunt not found.", ephemeral=True)
+            return
+        
         success, message = hunt_manager.remove_user(
-            interaction.channel.id,
+            int(channel_id),
             self.hunt_index,
             interaction.user.id
         )
         await interaction.response.send_message(message, ephemeral=True)
         if success:
-            await update_weekly_message(interaction.channel.id)
+            await update_hunt_message(int(channel_id), self.hunt_index)
 
 class PartySelectView(discord.ui.View):
-    def __init__(self, hunt_index, role, user):
+    def __init__(self, hunt_index, role, user, channel_id):
         super().__init__(timeout=180)
         self.hunt_index = hunt_index
         self.role = role
         self.user = user
+        self.channel_id = channel_id
         
-        # Add party buttons
+        # Get current hunt data to check party status
+        weekly = hunt_manager.get_weekly_hunts(channel_id)
+        hunt = weekly['hunts'][hunt_index] if weekly and hunt_index < len(weekly['hunts']) else None
+        
         for i in range(1, 9):
+            # Check if this party slot is full for this role
+            is_full = False
+            if hunt:
+                party = hunt['parties'].get(str(i))
+                if role == 'tank' and party['tank']:
+                    is_full = True
+                elif role == 'support' and party['support']:
+                    is_full = True
+                elif role == 'dps' and len(party['dps']) >= 3:
+                    is_full = True
+            
             button = discord.ui.Button(
                 label=f"Party {i}",
                 style=discord.ButtonStyle.primary if i not in [1, 2] else discord.ButtonStyle.secondary,
-                custom_id=f"party_{i}",
-                emoji="👑" if i in [1, 2] else "🎯"
+                custom_id=f"party_{i}_{hunt_index}",
+                emoji="👑" if i in [1, 2] else "🎯",
+                disabled=is_full
             )
             button.callback = self.create_party_callback(i)
             self.add_item(button)
         
+        # Add Un-Sign Up button
+        unsignup_button = discord.ui.Button(
+            label="Un-Sign Up (Remove Role)",
+            style=discord.ButtonStyle.danger,
+            emoji="🚫"
+        )
+        unsignup_button.callback = self.unsignup_callback
+        self.add_item(unsignup_button)
+        
         # Add leave party button
         leave_button = discord.ui.Button(
-            label="Leave Party",
-            style=discord.ButtonStyle.danger,
+            label="Leave My Party",
+            style=discord.ButtonStyle.secondary,
             emoji="❌"
         )
         leave_button.callback = self.leave_party_callback
@@ -539,42 +649,62 @@ class PartySelectView(discord.ui.View):
         async def callback(interaction: discord.Interaction):
             user_role_names = [role.name for role in interaction.user.roles]
             success, message = hunt_manager.join_party(
-                interaction.channel.id,
+                self.channel_id,
                 self.hunt_index,
                 party_num,
                 interaction.user.id,
                 interaction.user.display_name,
-                self.role,
                 user_role_names
             )
+            
+            # Add current status to message
+            if success:
+                party_num_current, role_current = hunt_manager.get_user_party(self.channel_id, self.hunt_index, interaction.user.id)
+                if party_num_current:
+                    message += f"\n\n**Current Status:** You are now in Party {party_num_current} as {role_current}."
+            
             await interaction.response.send_message(message, ephemeral=True)
             if success:
-                await update_weekly_message(interaction.channel.id)
+                await update_hunt_message(self.channel_id, self.hunt_index)
         return callback
     
-    async def leave_party_callback(self, interaction: discord.Interaction):
-        success, message = hunt_manager.leave_party(
-            interaction.channel.id,
+    async def unsignup_callback(self, interaction: discord.Interaction):
+        success, message = hunt_manager.remove_user(
+            self.channel_id,
             self.hunt_index,
             interaction.user.id
         )
         await interaction.response.send_message(message, ephemeral=True)
         if success:
-            await update_weekly_message(interaction.channel.id)
+            await update_hunt_message(self.channel_id, self.hunt_index)
+    
+    async def leave_party_callback(self, interaction: discord.Interaction):
+        success, message = hunt_manager.leave_party(
+            self.channel_id,
+            self.hunt_index,
+            interaction.user.id
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        if success:
+            await update_hunt_message(self.channel_id, self.hunt_index)
 
-async def update_weekly_message(channel_id):
+async def update_hunt_message(channel_id, hunt_index):
     weekly = hunt_manager.get_weekly_hunts(channel_id)
-    if not weekly or not weekly.get('message_id'):
+    if not weekly or hunt_index >= len(weekly['hunts']):
         return
     
-    channel = bot.get_channel(weekly['channel_id'])
+    hunt = weekly['hunts'][hunt_index]
+    if not hunt.get('message_id'):
+        return
+    
+    channel = bot.get_channel(channel_id)
     if not channel:
         return
     
     try:
-        message = await channel.fetch_message(weekly['message_id'])
-        embed = create_weekly_embed(weekly)
-        view = HuntDayView(weekly)
+        message = await channel.fetch_message(hunt['message_id'])
+        embed = create_hunt_embed(hunt, hunt_index)
+        view = HuntSignupView(hunt_index)
         await message.edit(embed=embed, view=view)
     except Exception as e:
         print(f"Error updating message: {e}")
@@ -582,6 +712,12 @@ async def update_weekly_message(channel_id):
 @bot.event
 async def on_ready():
     print(f'{bot.user} is now online!')
+    
+    for weekly in hunt_manager.weekly_hunts.values():
+        for idx, hunt in enumerate(weekly['hunts']):
+            if hunt.get('message_id'):
+                bot.add_view(HuntSignupView(idx), message_id=hunt['message_id'])
+    
     check_weekly_reset.start()
     update_hunt_timers.start()
 
@@ -589,44 +725,94 @@ async def on_ready():
 async def check_weekly_reset():
     now = datetime.now(TIMEZONE)
     
-    # Check if it's Monday at 00:00
     if now.weekday() == 0 and now.hour == 0 and now.minute == 0:
         for guild in bot.guilds:
             for channel in guild.text_channels:
                 if channel.name == 'guild-hunt-organization':
-                    await create_weekly_hunt_post(channel)
+                    await create_weekly_hunt_posts(channel)
 
 @tasks.loop(minutes=5)
 async def update_hunt_timers():
-    for hunt_id, weekly in hunt_manager.weekly_hunts.items():
-        await update_weekly_message(weekly['channel_id'])
+    for channel_id, weekly in hunt_manager.weekly_hunts.items():
+        for idx in range(len(weekly['hunts'])):
+            await update_hunt_message(int(channel_id), idx)
 
-async def create_weekly_hunt_post(channel):
+async def create_weekly_hunt_posts(channel):
+    # Retrieve old message IDs before creating new hunts
+    weekly_hunts_data = hunt_manager.get_weekly_hunts(channel.id)
+    old_message_ids = []
+    if weekly_hunts_data:
+        for hunt in weekly_hunts_data.get('hunts', []):
+            if hunt.get('message_id'):
+                old_message_ids.append(hunt['message_id'])
+    
     hunt_id = hunt_manager.create_weekly_hunts(channel.id)
     weekly = hunt_manager.get_weekly_hunts(channel.id)
     
-    embed = create_weekly_embed(weekly)
-    view = HuntDayView(weekly)
-    message = await channel.send(embed=embed, view=view)
+    # 1. Delete Old Messages
+    for msg_id in old_message_ids:
+        try:
+            message = await channel.fetch_message(msg_id)
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            print(f"Error deleting old message {msg_id}: {e}")
     
-    weekly['message_id'] = message.id
-    hunt_manager.save_data()
+    # 2. Post New Messages
+    member_role = discord.utils.get(channel.guild.roles, name="Member")
+    ping_text = f"{member_role.mention} Guild Hunts for this week!" if member_role else "Guild Hunts for this week!"
+    
+    await channel.send(ping_text)
+    
+    for idx, hunt in enumerate(weekly['hunts']):
+        embed = create_hunt_embed(hunt, idx)
+        view = HuntSignupView(idx)
+        message = await channel.send(embed=embed, view=view)
+        
+        hunt['message_id'] = message.id
+        hunt_manager.save_data()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def createweeklyhunts(ctx):
     """Create weekly hunt signups (Admin only)"""
+    # Retrieve old message IDs before creating new hunts
+    weekly_hunts_data = hunt_manager.get_weekly_hunts(ctx.channel.id)
+    old_message_ids = []
+    if weekly_hunts_data:
+        for hunt in weekly_hunts_data.get('hunts', []):
+            if hunt.get('message_id'):
+                old_message_ids.append(hunt['message_id'])
+    
     hunt_id = hunt_manager.create_weekly_hunts(ctx.channel.id)
     weekly = hunt_manager.get_weekly_hunts(ctx.channel.id)
     
-    embed = create_weekly_embed(weekly)
-    view = HuntDayView(weekly)
-    message = await ctx.send(embed=embed, view=view)
+    # 1. Delete Old Messages
+    for msg_id in old_message_ids:
+        try:
+            message = await ctx.channel.fetch_message(msg_id)
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            print(f"Error deleting old message {msg_id}: {e}")
     
-    weekly['message_id'] = message.id
-    hunt_manager.save_data()
+    # 2. Post New Messages
+    member_role = discord.utils.get(ctx.guild.roles, name="Member")
+    ping_text = f"{member_role.mention} Guild Hunts for this week!" if member_role else "Guild Hunts for this week!"
     
-    await ctx.send("✅ Weekly hunts created!", delete_after=5)
+    await ctx.send(ping_text)
+    
+    for idx, hunt in enumerate(weekly['hunts']):
+        embed = create_hunt_embed(hunt, idx)
+        view = HuntSignupView(idx)
+        message = await ctx.send(embed=embed, view=view)
+        
+        hunt['message_id'] = message.id
+        hunt_manager.save_data()
+    
+    await ctx.message.delete()
 
-# Run the bot
-bot.run(os.getenv('BOT_TOKEN'))
+bot.run(os.getenv("BOT_TOKEN"))
+
