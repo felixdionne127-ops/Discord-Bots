@@ -84,7 +84,8 @@ class HuntManager:
                     '7': {'tank': None, 'support': None, 'dps': []},
                     '8': {'tank': None, 'support': None, 'dps': []}
                 },
-                'message_id': None
+                'message_id': None,
+                'reminder_sent': False
             })
         
         self.weekly_hunts[hunt_id] = {
@@ -720,6 +721,7 @@ async def on_ready():
     
     check_weekly_reset.start()
     update_hunt_timers.start()
+    check_hunt_reminders.start()
 
 @tasks.loop(minutes=1)
 async def check_weekly_reset():
@@ -730,6 +732,58 @@ async def check_weekly_reset():
             for channel in guild.text_channels:
                 if channel.name == 'guild-hunt-organization':
                     await create_weekly_hunt_posts(channel)
+
+@tasks.loop(minutes=1)
+async def check_hunt_reminders():
+    """Check if any hunts are starting in 30 minutes and send reminders"""
+    now = datetime.now(TIMEZONE)
+    
+    for channel_id, weekly in hunt_manager.weekly_hunts.items():
+        channel = bot.get_channel(int(channel_id))
+        if not channel:
+            continue
+        
+        for idx, hunt in enumerate(weekly['hunts']):
+            # Skip if reminder already sent
+            if hunt.get('reminder_sent', False):
+                continue
+            
+            hunt_time = datetime.fromisoformat(hunt['hunt_time'])
+            time_diff = hunt_time - now
+            
+            # Check if hunt is starting in 30 minutes (with 1 minute buffer)
+            minutes_until = time_diff.total_seconds() / 60
+            if 29 <= minutes_until <= 31:
+                # Send reminder
+                member_role = discord.utils.get(channel.guild.roles, name="Member")
+                ping_text = f"{member_role.mention}" if member_role else "@everyone"
+                
+                embed = discord.Embed(
+                    title="⚠️ Guild Hunt Starting Soon! ⚠️",
+                    description=f"**{hunt['label']}** starts in **30 minutes**!\n\nMake sure you're in your party and ready to go!",
+                    color=discord.Color.orange()
+                )
+                
+                # List parties with members
+                party_info = ""
+                for party_num in range(1, 9):
+                    party = hunt['parties'][str(party_num)]
+                    party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
+                    
+                    if party_count > 0:
+                        party_info += f"**Party {party_num}** ({party_count}/5)\n"
+                
+                if party_info:
+                    embed.add_field(name="Active Parties", value=party_info, inline=False)
+                
+                total_signed = len(hunt['signed_up'])
+                embed.set_footer(text=f"Total signed up: {total_signed}")
+                
+                await channel.send(ping_text, embed=embed)
+                
+                # Mark reminder as sent
+                hunt['reminder_sent'] = True
+                hunt_manager.save_data()
 
 @tasks.loop(minutes=5)
 async def update_hunt_timers():
