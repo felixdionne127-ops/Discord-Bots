@@ -771,7 +771,15 @@ async def check_hunt_reminders():
                     party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
                     
                     if party_count > 0:
-                        party_info += f"**Party {party_num}** ({party_count}/5)\n"
+                        members = []
+                        if party['tank']:
+                            members.append(f"{party['tank']['name']} (Tank)")
+                        if party['support']:
+                            members.append(f"{party['support']['name']} (Support)")
+                        for dps in party['dps']:
+                            members.append(f"{dps['name']} (DPS)")
+                        
+                        party_info += f"**Party {party_num}** ({party_count}/5): {', '.join(members)}\n"
                 
                 if party_info:
                     embed.add_field(name="Active Parties", value=party_info, inline=False)
