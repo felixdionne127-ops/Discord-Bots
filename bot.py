@@ -421,53 +421,42 @@ def create_hunt_embed(hunt, hunt_index):
     description += f"{time_str} | Signed up: **{total_signups}**\n\n"
     description += "*Parties 1 & 2 reserved for leadership 👑 | Sign up with role, then pick party*\n\n"
     
-    # Create 4x2 grid layout
-    rows = [[1, 2, 3, 4], [5, 6, 7, 8]]
-    
-    grid_text = ""
-    for row in rows:
-        party_lines = {
-            'header': [],
-            'tank': [],
-            'support': [],
-            'dps': []
-        }
+    # Display parties in a compact 2-column format
+    for row in range(4):  # 4 rows
+        left_party_num = row + 1
+        right_party_num = row + 5
         
-        for party_num in row:
-            party = hunt['parties'][str(party_num)]
-            party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
-            
-            header = f"P{party_num}({party_count}/5)"
-            if party_num in [1, 2]:
-                header += "👑"
-            party_lines['header'].append(header)
-            
-            if party_count == 0 or not party['tank']:
-                tank_text = "🛡️ --"
-            else:
-                tank_text = f"🛡️ {party['tank']['name'][:8]}"
-            party_lines['tank'].append(tank_text)
-            
-            if party_count == 0 or not party['support']:
-                support_text = "💚 --"
-            else:
-                support_text = f"💚 {party['support']['name'][:8]}"
-            party_lines['support'].append(support_text)
-            
-            if party_count == 0 or len(party['dps']) == 0:
-                dps_text = "⚔️ --"
-            else:
-                dps_names = [d['name'][:7] for d in party['dps']]
-                dps_text = f"⚔️ {','.join(dps_names)}"
-            party_lines['dps'].append(dps_text)
+        left_party = hunt['parties'][str(left_party_num)]
+        right_party = hunt['parties'][str(right_party_num)]
         
-        col_width = 15
-        grid_text += ' | '.join(f"{h:<{col_width}}" for h in party_lines['header']) + '\n'
-        grid_text += ' | '.join(f"{t:<{col_width}}" for t in party_lines['tank']) + '\n'
-        grid_text += ' | '.join(f"{s:<{col_width}}" for s in party_lines['support']) + '\n'
-        grid_text += ' | '.join(f"{d:<{col_width}}" for d in party_lines['dps']) + '\n\n'
-    
-    description += f"```\n{grid_text}```\n"
+        left_count = (1 if left_party['tank'] else 0) + (1 if left_party['support'] else 0) + len(left_party['dps'])
+        right_count = (1 if right_party['tank'] else 0) + (1 if right_party['support'] else 0) + len(right_party['dps'])
+        
+        # Party headers
+        left_header = f"**P{left_party_num}({left_count}/5)**"
+        if left_party_num in [1, 2]:
+            left_header += "👑"
+        
+        right_header = f"**P{right_party_num}({right_count}/5)**"
+        
+        description += f"{left_header} | {right_header}\n"
+        
+        # Tank line
+        left_tank = left_party['tank']['name'] if left_party['tank'] else "--"
+        right_tank = right_party['tank']['name'] if right_party['tank'] else "--"
+        description += f"🛡️ {left_tank} | 🛡️ {right_tank}\n"
+        
+        # Support line
+        left_support = left_party['support']['name'] if left_party['support'] else "--"
+        right_support = right_party['support']['name'] if right_party['support'] else "--"
+        description += f"💚 {left_support} | 💚 {right_support}\n"
+        
+        # DPS line
+        left_dps = ', '.join([d['name'] for d in left_party['dps']]) if left_party['dps'] else "--"
+        right_dps = ', '.join([d['name'] for d in right_party['dps']]) if right_party['dps'] else "--"
+        description += f"⚔️ {left_dps} | ⚔️ {right_dps}\n"
+        
+        description += "\n"
     
     # Add users not in party with role icons
     not_in_party = []
