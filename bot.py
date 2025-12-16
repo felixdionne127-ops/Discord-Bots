@@ -419,45 +419,39 @@ def create_hunt_embed(hunt, hunt_index):
     description = f"**{hunt['label']}**\n"
     description += f"📅 <t:{timestamp}:F>\n"
     description += f"{time_str} | Signed up: **{total_signups}**\n\n"
-    description += "*Parties 1 & 2 reserved for leadership 👑 | Sign up with role, then pick party*\n\n"
+    description += "*Parties 1 & 2 reserved for leadership 👑*\n\n"
     
-    # Display parties in a compact 2-column format with spacing
-    for row in range(4):  # 4 rows
-        left_party_num = row + 1
-        right_party_num = row + 5
+    # Display parties in compact single-line format
+    for party_num in range(1, 9):
+        party = hunt['parties'][str(party_num)]
+        party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
         
-        left_party = hunt['parties'][str(left_party_num)]
-        right_party = hunt['parties'][str(right_party_num)]
+        # Party header
+        header = f"**Party {party_num}**"
+        if party_num in [1, 2]:
+            header += " 👑"
+        header += f" ({party_count}/5): "
         
-        left_count = (1 if left_party['tank'] else 0) + (1 if left_party['support'] else 0) + len(left_party['dps'])
-        right_count = (1 if right_party['tank'] else 0) + (1 if right_party['support'] else 0) + len(right_party['dps'])
+        members = []
         
-        # Party headers
-        left_header = f"**P{left_party_num}({left_count}/5)**"
-        if left_party_num in [1, 2]:
-            left_header += "👑"
+        # Add tank
+        if party['tank']:
+            members.append(f"{party['tank']['name']} (🛡️)")
         
-        right_header = f"**P{right_party_num}({right_count}/5)**"
+        # Add support
+        if party['support']:
+            members.append(f"{party['support']['name']} (💚)")
         
-        description += f"{left_header}          {right_header}\n"
+        # Add DPS
+        for dps in party['dps']:
+            members.append(f"{dps['name']} (⚔️)")
         
-        # Tank line
-        left_tank = left_party['tank']['name'] if left_party['tank'] else "--"
-        right_tank = right_party['tank']['name'] if right_party['tank'] else "--"
-        description += f"🛡️ {left_tank}          🛡️ {right_tank}\n"
-        
-        # Support line
-        left_support = left_party['support']['name'] if left_party['support'] else "--"
-        right_support = right_party['support']['name'] if right_party['support'] else "--"
-        description += f"💚 {left_support}          💚 {right_support}\n"
-        
-        # DPS line
-        left_dps = ', '.join([d['name'] for d in left_party['dps']]) if left_party['dps'] else "--"
-        right_dps = ', '.join([d['name'] for d in right_party['dps']]) if right_party['dps'] else "--"
-        description += f"⚔️ {left_dps}          ⚔️ {right_dps}\n"
-        
-        # Add spacing between party pairs
-        description += "\n"
+        if members:
+            description += header + ", ".join(members) + "\n"
+        else:
+            description += header + "*Empty*\n"
+    
+    description += "\n"
     
     # Add users not in party with role icons
     not_in_party = []
