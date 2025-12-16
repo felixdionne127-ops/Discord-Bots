@@ -419,37 +419,41 @@ def create_hunt_embed(hunt, hunt_index):
     description = f"**{hunt['label']}**\n"
     description += f"📅 <t:{timestamp}:F>\n"
     description += f"{time_str} | Signed up: **{total_signups}**\n\n"
-    description += "*Parties 1 & 2 reserved for leadership 👑*\n\n"
+    description += "*Parties 1 & 2 reserved for leadership 👑*\n"
+    description += "🛡️ Tank | 💚 Support | ⚔️ DPS\n\n"
     
-    # Display parties in compact single-line format
+    # Display parties in compact single-line format with fixed role slots
     for party_num in range(1, 9):
         party = hunt['parties'][str(party_num)]
         party_count = (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps'])
         
+        # Readiness indicator
+        if party_count == 5:
+            indicator = "✅"
+        elif party_count > 0:
+            indicator = "⚠️"
+        else:
+            indicator = "❌"
+        
         # Party header
-        header = f"**Party {party_num}**"
+        header = f"{indicator} **Party {party_num}**"
         if party_num in [1, 2]:
             header += " 👑"
         header += f" ({party_count}/5): "
         
-        members = []
+        # Tank slot
+        tank = f"**{party['tank']['name']}**" if party['tank'] else "*Empty*"
         
-        # Add tank
-        if party['tank']:
-            members.append(f"{party['tank']['name']} (🛡️)")
+        # Support slot
+        support = f"**{party['support']['name']}**" if party['support'] else "*Empty*"
         
-        # Add support
-        if party['support']:
-            members.append(f"{party['support']['name']} (💚)")
-        
-        # Add DPS
-        for dps in party['dps']:
-            members.append(f"{dps['name']} (⚔️)")
-        
-        if members:
-            description += header + ", ".join(members) + "\n"
+        # DPS slots
+        if party['dps']:
+            dps_names = ', '.join([f"**{d['name']}**" for d in party['dps']])
         else:
-            description += header + "*Empty*\n"
+            dps_names = "*Empty*"
+        
+        description += f"{header}🛡️ {tank} | 💚 {support} | ⚔️ {dps_names}\n"
     
     description += "\n"
     
