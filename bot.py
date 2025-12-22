@@ -5,6 +5,7 @@ import pytz
 import json
 import os
 import logging
+import time
 from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +20,7 @@ pending_selections = defaultdict(dict)
 HUNT_SCHEDULE = [{'day': 4, 'hour': 21, 'minute': 0, 'label': 'Friday 21:00'}, {'day': 5, 'hour': 21, 'minute': 0, 'label': 'Saturday 21:00'}, {'day': 6, 'hour': 21, 'minute': 0, 'label': 'Sunday 21:00'}]
 PRIORITY_ROLES = ['Frontrunner', 'Envoy', 'Strategist', 'GM', 'Quartermaster', 'Administrator', 'Vice Master']
 ROLE_ICONS = {'tank': '🛡️', 'support': '💚', 'dps': '⚔️'}
+MAX_PARTIES_PER_USER = 3  # Maximum parties a user can join as filler
 
 class HuntManager:
     def __init__(self):
@@ -43,8 +45,11 @@ class HuntManager:
             self.weekly_hunts = {}
     def save_data(self):
         try:
-            with open('/app/data/hunts.json', 'w') as f:
+            # Atomic write to prevent corruption
+            tmp_file = '/app/data/hunts.tmp'
+            with open(tmp_file, 'w') as f:
                 json.dump(self.weekly_hunts, f, indent=4)
+            os.replace(tmp_file, '/app/data/hunts.json')
         except Exception as e:
             logging.error(f"Error saving hunts.json: {e}")
     def cleanup_old_hunts(self):
@@ -78,6 +83,25 @@ class HuntManager:
                 if hunt.get('message_id') == message_id:
                     return channel_id, idx, hunt
         return None, None, None
+    def count_user_parties(self, hunt, user_id):
+        """Count how many parties a user is in"""
+        count = 0
+        for party in hunt['parties'].values():
+            if (party['tank'] and party['tank']['id'] == user_id) or \
+               (party['support'] and party['support']['id'] == user_id) or \
+               any(d['id'] == user_id for d in party['dps']):
+                count += 1
+        return count
+    def user_has_role_in_any_party(self, hunt, user_id, role):
+        """Check if user already has this role in any party"""
+        if role == 'dps':
+            return False  # DPS can fill multiple parties
+        for party in hunt['parties'].values():
+            if role == 'tank' and party['tank'] and party['tank']['id'] == user_id:
+                return True
+            if role == 'support' and party['support'] and party['support']['id'] == user_id:
+                return True
+        return False
     def join_party_with_role(self, channel_id, hunt_index, party_number, role, user_id, username, user_roles):
         lock_key = f"{channel_id}_{hunt_index}_{user_id}_{party_number}"
         if lock_key in self.locks:
@@ -90,11 +114,28 @@ class HuntManager:
             hunt, party = weekly['hunts'][hunt_index], weekly['hunts'][hunt_index]['parties'].get(str(party_number))
             if not party:
                 return False, "Invalid party number."
-            if party_number in [1, 2] and not any(r in PRIORITY_ROLES for r in user_roles):
+            
+            # Check priority roles with case-insensitive comparison
+            priority_roles = {r.lower() for r in PRIORITY_ROLES}
+            user_roles_lower = {r.lower() for r in user_roles}
+            if party_number in [1, 2] and not any(r in priority_roles for r in user_roles_lower):
                 return False, f"Party {party_number} is reserved for leadership roles only."
-            is_in_party = (party['tank'] and party['tank']['id'] == user_id) or (party['support'] and party['support']['id'] == user_id) or any(d['id'] == user_id for d in party['dps'])
+            
+            is_in_party = (party['tank'] and party['tank']['id'] == user_id) or \
+                         (party['support'] and party['support']['id'] == user_id) or \
+                         any(d['id'] == user_id for d in party['dps'])
             if is_in_party:
                 return False, f"You're already in Party {party_number}!"
+            
+            # Check filler restrictions
+            party_count = self.count_user_parties(hunt, user_id)
+            if party_count >= MAX_PARTIES_PER_USER:
+                return False, f"You can only join up to {MAX_PARTIES_PER_USER} parties as a filler."
+            
+            # Tank/Support can only fill one party with that role
+            if role in ['tank', 'support'] and self.user_has_role_in_any_party(hunt, user_id, role):
+                return False, f"You can only {role} in one party. You can join other parties as DPS."
+            
             user_data = {'id': user_id, 'name': username, 'role': role}
             if role == 'tank':
                 if party['tank']:
@@ -111,7 +152,7 @@ class HuntManager:
             if not any(u['id'] == user_id for u in hunt['signed_up']):
                 hunt['signed_up'].append(user_data)
             self.save_data()
-            return True, f"Joined Party {party_number} as {role}! You can join another party as a filler if needed."
+            return True, f"Joined Party {party_number} as {role}! You can join up to {MAX_PARTIES_PER_USER} parties total."
         finally:
             self.locks.discard(lock_key)
     def signup_tentative(self, channel_id, hunt_index, user_id, username):
@@ -139,6 +180,9 @@ class HuntManager:
             if p['support'] and p['support']['id'] == user_id:
                 p['support'] = None
             p['dps'] = [d for d in p['dps'] if d['id'] != user_id]
+    def remove_user_from_tentative(self, hunt, user_id):
+        """Remove user from tentative only"""
+        hunt['tentative'] = [u for u in hunt['tentative'] if u['id'] != user_id]
     def remove_user(self, channel_id, hunt_index, user_id):
         lock_key = f"{channel_id}_{hunt_index}_{user_id}"
         if lock_key in self.locks:
@@ -156,10 +200,15 @@ class HuntManager:
 
 hunt_manager = HuntManager()
 
+def normalize_datetime(dt):
+    """Safely normalize datetime with timezone"""
+    if dt.tzinfo is None:
+        return TIMEZONE.localize(dt)
+    else:
+        return dt.astimezone(TIMEZONE)
+
 def create_hunt_embed(hunt, hunt_index):
-    now, hunt_time = datetime.now(TIMEZONE), datetime.fromisoformat(hunt['hunt_time'])
-    if hunt_time.tzinfo is None:
-        hunt_time = TIMEZONE.localize(hunt_time)
+    now, hunt_time = datetime.now(TIMEZONE), normalize_datetime(datetime.fromisoformat(hunt['hunt_time']))
     time_diff, is_locked = hunt_time - now, datetime.now(TIMEZONE) >= hunt_time
     if time_diff.total_seconds() > 0:
         days, hours, minutes = time_diff.days, time_diff.seconds // 3600, (time_diff.seconds % 3600) // 60
@@ -180,7 +229,7 @@ def create_hunt_embed(hunt, hunt_index):
     if hunt['tentative']:
         description += f"**❓ Tentative:** {', '.join([u['name'] for u in hunt['tentative']])}\n"
     embed = discord.Embed(title=f"🏹 Guild Hunt - {hunt['label']} 🏹", description=description, color=discord.Color.green() if not is_locked else discord.Color.dark_grey())
-    embed.set_footer(text="First select party, then select role | You can join multiple parties!" if not is_locked else "Hunt has started - signups closed")
+    embed.set_footer(text=f"First select party, then select role | Max {MAX_PARTIES_PER_USER} parties per person!" if not is_locked else "Hunt has started - signups closed")
     return embed
 
 class HuntLeaveView(discord.ui.View):
@@ -248,6 +297,20 @@ async def update_hunt_message(channel_id, hunt_index):
     except:
         pass
 
+def cleanup_expired_selections():
+    """Remove pending selections older than 2 minutes"""
+    current_time = time.time()
+    expired = []
+    for key, data in pending_selections.items():
+        if isinstance(data, dict) and 'timestamp' in data:
+            if current_time - data['timestamp'] > 120:  # 2 minutes
+                expired.append(key)
+        elif isinstance(data, int):
+            # Old format, convert to new format
+            pending_selections[key] = {'party': data, 'timestamp': current_time}
+    for key in expired:
+        pending_selections.pop(key, None)
+
 @bot.event
 async def on_ready():
     logging.info(f'{bot.user} is now online!')
@@ -259,6 +322,7 @@ async def on_ready():
     update_hunt_timers.start()
     check_hunt_reminders.start()
     cleanup_old_hunts_task.start()
+    cleanup_pending_selections_task.start()
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -272,9 +336,7 @@ async def on_raw_reaction_add(payload):
     if now - user_cooldowns[payload.user_id][user_key] < 3.0:
         return
     user_cooldowns[payload.user_id][user_key] = now
-    hunt_time = datetime.fromisoformat(hunt['hunt_time'])
-    if hunt_time.tzinfo is None:
-        hunt_time = TIMEZONE.localize(hunt_time)
+    hunt_time = normalize_datetime(datetime.fromisoformat(hunt['hunt_time']))
     if datetime.now(TIMEZONE) >= hunt_time:
         return
     emoji_str = str(payload.emoji)
@@ -283,6 +345,15 @@ async def on_raw_reaction_add(payload):
         member = guild.get_member(payload.user_id)
     if not member:
         return
+    
+    # Try to remove the reaction for cleanup
+    try:
+        channel = bot.get_channel(payload.channel_id)
+        message = await channel.fetch_message(payload.message_id)
+        await message.remove_reaction(payload.emoji, member)
+    except:
+        pass
+    
     if emoji_str == '❓':
         success, message = hunt_manager.signup_tentative(int(channel_id), hunt_index, payload.user_id, member.display_name)
         if success:
@@ -296,7 +367,10 @@ async def on_raw_reaction_add(payload):
     party_emojis = {'1️⃣': 1, '2️⃣': 2, '3️⃣': 3, '4️⃣': 4, '5️⃣': 5, '6️⃣': 6, '7️⃣': 7, '8️⃣': 8}
     if emoji_str in party_emojis:
         party_num = party_emojis[emoji_str]
-        pending_selections[f"{channel_id}_{hunt_index}_{payload.user_id}"] = party_num
+        pending_selections[f"{channel_id}_{hunt_index}_{payload.user_id}"] = {
+            'party': party_num,
+            'timestamp': time.time()
+        }
         try:
             await member.send(f"**Hunt Signup:** You selected Party {party_num}. Now react with your role: 🛡️ (Tank), 💚 (Support), or ⚔️ (DPS)")
         except:
@@ -312,7 +386,8 @@ async def on_raw_reaction_add(payload):
             except:
                 pass
             return
-        party_num = pending_selections[selection_key]
+        selection_data = pending_selections[selection_key]
+        party_num = selection_data['party'] if isinstance(selection_data, dict) else selection_data
         user_roles = [r.name for r in member.roles]
         success, message = hunt_manager.join_party_with_role(int(channel_id), hunt_index, party_num, role, payload.user_id, member.display_name, user_roles)
         if success:
@@ -330,20 +405,47 @@ async def on_raw_reaction_remove(payload):
     channel_id, hunt_index, hunt = hunt_manager.get_hunt_by_message(payload.message_id)
     if not channel_id or not hunt or str(payload.emoji) != '❓':
         return
-    success, _ = hunt_manager.remove_user(int(channel_id), hunt_index, payload.user_id)
-    if success:
+    
+    # Only remove from tentative, not full removal
+    weekly = hunt_manager.get_weekly_hunts(int(channel_id))
+    if weekly and hunt_index < len(weekly['hunts']):
+        hunt_manager.remove_user_from_tentative(weekly['hunts'][hunt_index], payload.user_id)
+        hunt_manager.save_data()
         await update_hunt_message(int(channel_id), hunt_index)
 
 @tasks.loop(minutes=1)
 async def check_weekly_reset():
     now = datetime.now(TIMEZONE)
-    if now.weekday() == 0 and now.hour == 0 and now.minute < 5:
-        for guild in bot.guilds:
-            for channel in guild.text_channels:
-                if channel.name == 'guild-hunt-organization':
-                    weekly_data = hunt_manager.get_weekly_hunts(channel.id)
-                    if not weekly_data or (datetime.now(TIMEZONE) - datetime.fromisoformat(weekly_data.get('last_reset', weekly_data['created_at']))).days >= 6:
-                        await post_new_hunts_to_channel(channel)
+    
+    # CRITICAL FIX: Only run at exactly 1:00 AM on Monday to prevent multiple posts
+    if now.weekday() != 0 or now.hour != 1 or now.minute != 0:
+        return
+    
+    logging.info("Weekly reset check triggered at exactly 1:00 AM Monday")
+    
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if channel.name == 'guild-hunt-organization':
+                weekly_data = hunt_manager.get_weekly_hunts(channel.id)
+                
+                # If no data exists, create hunts immediately
+                if not weekly_data:
+                    logging.info(f"No hunt data found for channel {channel.id}, creating new hunts")
+                    await post_new_hunts_to_channel(channel)
+                    continue
+                
+                # Get the last reset time
+                last_reset = normalize_datetime(datetime.fromisoformat(weekly_data.get('last_reset', weekly_data['created_at'])))
+                
+                # Calculate this Monday at 1 AM
+                monday_1am = now.replace(hour=1, minute=0, second=0, microsecond=0)
+                
+                # If last reset was before this Monday at 1 AM, post new hunts
+                if last_reset < monday_1am:
+                    logging.info(f"Last reset was {last_reset}, posting new hunts for channel {channel.id}")
+                    await post_new_hunts_to_channel(channel)
+                else:
+                    logging.info(f"Hunts already posted this week for channel {channel.id} (last reset: {last_reset})")
 
 @tasks.loop(minutes=1)
 async def check_hunt_reminders():
@@ -355,9 +457,7 @@ async def check_hunt_reminders():
         for idx, hunt in enumerate(weekly['hunts']):
             if hunt.get('reminder_sent_at'):
                 continue
-            hunt_time = datetime.fromisoformat(hunt['hunt_time'])
-            if hunt_time.tzinfo is None:
-                hunt_time = TIMEZONE.localize(hunt_time)
+            hunt_time = normalize_datetime(datetime.fromisoformat(hunt['hunt_time']))
             minutes_until = (hunt_time - now).total_seconds() / 60
             if 29 <= minutes_until <= 31:
                 try:
@@ -381,6 +481,10 @@ async def check_hunt_reminders():
 @tasks.loop(hours=6)
 async def cleanup_old_hunts_task():
     hunt_manager.cleanup_old_hunts()
+
+@tasks.loop(minutes=5)
+async def cleanup_pending_selections_task():
+    cleanup_expired_selections()
 
 @tasks.loop(minutes=5)
 async def update_hunt_timers():
