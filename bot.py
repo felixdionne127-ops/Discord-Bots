@@ -22,6 +22,9 @@ PRIORITY_ROLES = ['Frontrunner', 'Envoy', 'Strategist', 'GM', 'Quartermaster', '
 ROLE_ICONS = {'tank': '🛡️', 'support': '💚', 'dps': '⚔️'}
 MAX_PARTIES_PER_USER = 3  # Maximum parties a user can join as filler
 
+# UPDATED: Specific channel ID for automated messages
+HUNT_CHANNEL_ID = 1432167703963242627
+
 class HuntManager:
     def __init__(self):
         self.weekly_hunts, self.locks = {}, set()
@@ -417,66 +420,75 @@ async def on_raw_reaction_remove(payload):
 async def check_weekly_reset():
     now = datetime.now(TIMEZONE)
     
-    # CRITICAL FIX: Only run at exactly 1:00 AM on Monday to prevent multiple posts
-    if now.weekday() != 0 or now.hour != 1 or now.minute != 0:
+    # CRITICAL FIX: Only run at exactly 2:00 AM on Monday to prevent multiple posts
+    if now.weekday() != 0 or now.hour != 2 or now.minute != 0:
         return
     
-    logging.info("Weekly reset check triggered at exactly 1:00 AM Monday")
+    logging.info("Weekly reset check triggered at exactly 2:00 AM Monday")
     
-    for guild in bot.guilds:
-        for channel in guild.text_channels:
-            if channel.name == 'guild-hunt-organization':
-                weekly_data = hunt_manager.get_weekly_hunts(channel.id)
-                
-                # If no data exists, create hunts immediately
-                if not weekly_data:
-                    logging.info(f"No hunt data found for channel {channel.id}, creating new hunts")
-                    await post_new_hunts_to_channel(channel)
-                    continue
-                
-                # Get the last reset time
-                last_reset = normalize_datetime(datetime.fromisoformat(weekly_data.get('last_reset', weekly_data['created_at'])))
-                
-                # Calculate this Monday at 1 AM
-                monday_1am = now.replace(hour=1, minute=0, second=0, microsecond=0)
-                
-                # If last reset was before this Monday at 1 AM, post new hunts
-                if last_reset < monday_1am:
-                    logging.info(f"Last reset was {last_reset}, posting new hunts for channel {channel.id}")
-                    await post_new_hunts_to_channel(channel)
-                else:
-                    logging.info(f"Hunts already posted this week for channel {channel.id} (last reset: {last_reset})")
+    # UPDATED: Use specific channel ID instead of searching by name
+    channel = bot.get_channel(HUNT_CHANNEL_ID)
+    if not channel:
+        logging.error(f"Could not find channel with ID {HUNT_CHANNEL_ID}")
+        return
+    
+    weekly_data = hunt_manager.get_weekly_hunts(channel.id)
+    
+    # If no data exists, create hunts immediately
+    if not weekly_data:
+        logging.info(f"No hunt data found for channel {channel.id}, creating new hunts")
+        await post_new_hunts_to_channel(channel)
+        return
+    
+    # Get the last reset time
+    last_reset = normalize_datetime(datetime.fromisoformat(weekly_data.get('last_reset', weekly_data['created_at'])))
+    
+    # Calculate this Monday at 2 AM
+    monday_2am = now.replace(hour=2, minute=0, second=0, microsecond=0)
+    
+    # If last reset was before this Monday at 2 AM, post new hunts
+    if last_reset < monday_2am:
+        logging.info(f"Last reset was {last_reset}, posting new hunts for channel {channel.id}")
+        await post_new_hunts_to_channel(channel)
+    else:
+        logging.info(f"Hunts already posted this week for channel {channel.id} (last reset: {last_reset})")
 
 @tasks.loop(minutes=1)
 async def check_hunt_reminders():
     now = datetime.now(TIMEZONE)
-    for channel_id, weekly in hunt_manager.weekly_hunts.items():
-        channel = bot.get_channel(int(channel_id))
-        if not channel:
+    
+    # UPDATED: Only check hunts for the specific channel
+    weekly = hunt_manager.get_weekly_hunts(HUNT_CHANNEL_ID)
+    if not weekly:
+        return
+    
+    channel = bot.get_channel(HUNT_CHANNEL_ID)
+    if not channel:
+        return
+    
+    for idx, hunt in enumerate(weekly['hunts']):
+        if hunt.get('reminder_sent_at'):
             continue
-        for idx, hunt in enumerate(weekly['hunts']):
-            if hunt.get('reminder_sent_at'):
-                continue
-            hunt_time = normalize_datetime(datetime.fromisoformat(hunt['hunt_time']))
-            minutes_until = (hunt_time - now).total_seconds() / 60
-            if 29 <= minutes_until <= 31:
-                try:
-                    member_role = discord.utils.get(channel.guild.roles, name="Member")
-                    embed = discord.Embed(title="⚠️ Guild Hunt Starting Soon! ⚠️", description=f"**{hunt['label']}** starts in **30 minutes**!\n\nMake sure you're in your party and ready to go!", color=discord.Color.orange())
-                    party_info = ""
-                    for party_num in range(1, 9):
-                        party = hunt['parties'][str(party_num)]
-                        if (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps']) > 0:
-                            members = ([f"{party['tank']['name']} (Tank)"] if party['tank'] else []) + ([f"{party['support']['name']} (Support)"] if party['support'] else []) + [f"{dps['name']} (DPS)" for dps in party['dps']]
-                            party_info += f"**Party {party_num}**: {', '.join(members)}\n"
-                    if party_info:
-                        embed.add_field(name="Active Parties", value=party_info, inline=False)
-                    embed.set_footer(text=f"Total signed up: {len(hunt['signed_up'])}")
-                    await channel.send(f"{member_role.mention}" if member_role else "@everyone", embed=embed)
-                    hunt['reminder_sent_at'] = now.isoformat()
-                    hunt_manager.save_data()
-                except:
-                    pass
+        hunt_time = normalize_datetime(datetime.fromisoformat(hunt['hunt_time']))
+        minutes_until = (hunt_time - now).total_seconds() / 60
+        if 29 <= minutes_until <= 31:
+            try:
+                member_role = discord.utils.get(channel.guild.roles, name="Member")
+                embed = discord.Embed(title="⚠️ Guild Hunt Starting Soon! ⚠️", description=f"**{hunt['label']}** starts in **30 minutes**!\n\nMake sure you're in your party and ready to go!", color=discord.Color.orange())
+                party_info = ""
+                for party_num in range(1, 9):
+                    party = hunt['parties'][str(party_num)]
+                    if (1 if party['tank'] else 0) + (1 if party['support'] else 0) + len(party['dps']) > 0:
+                        members = ([f"{party['tank']['name']} (Tank)"] if party['tank'] else []) + ([f"{party['support']['name']} (Support)"] if party['support'] else []) + [f"{dps['name']} (DPS)" for dps in party['dps']]
+                        party_info += f"**Party {party_num}**: {', '.join(members)}\n"
+                if party_info:
+                    embed.add_field(name="Active Parties", value=party_info, inline=False)
+                embed.set_footer(text=f"Total signed up: {len(hunt['signed_up'])}")
+                await channel.send(f"{member_role.mention}" if member_role else "@everyone", embed=embed)
+                hunt['reminder_sent_at'] = now.isoformat()
+                hunt_manager.save_data()
+            except Exception as e:
+                logging.error(f"Error sending hunt reminder: {e}")
 
 @tasks.loop(hours=6)
 async def cleanup_old_hunts_task():
@@ -488,9 +500,11 @@ async def cleanup_pending_selections_task():
 
 @tasks.loop(minutes=5)
 async def update_hunt_timers():
-    for channel_id, weekly in hunt_manager.weekly_hunts.items():
+    # UPDATED: Only update hunts for the specific channel
+    weekly = hunt_manager.get_weekly_hunts(HUNT_CHANNEL_ID)
+    if weekly:
         for idx in range(len(weekly['hunts'])):
-            await update_hunt_message(int(channel_id), idx)
+            await update_hunt_message(HUNT_CHANNEL_ID, idx)
 
 async def post_new_hunts_to_channel(channel):
     try:
