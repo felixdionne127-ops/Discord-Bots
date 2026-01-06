@@ -255,22 +255,33 @@ class HuntLeaveView(discord.ui.View):
 class BugReportModal(discord.ui.Modal, title="Report a Bug"):
     bug_title = discord.ui.TextInput(label="Bug Title", placeholder="Brief summary of the issue", max_length=100, required=True)
     bug_description = discord.ui.TextInput(label="Description", placeholder="Describe what happened, what you expected, and steps to reproduce", style=discord.TextStyle.paragraph, max_length=1000, required=True)
+    
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        embed = discord.Embed(title=f"🐛 Bug Report: {self.bug_title.value}", description=self.bug_description.value, color=discord.Color.red(), timestamp=datetime.now(TIMEZONE))
+        
+        embed = discord.Embed(
+            title=f"🐛 Bug Report: {self.bug_title.value}", 
+            description=self.bug_description.value, 
+            color=discord.Color.red(), 
+            timestamp=datetime.now(TIMEZONE)
+        )
         embed.add_field(name="Reported By", value=f"{interaction.user.mention} ({interaction.user.name})", inline=True)
         embed.add_field(name="User ID", value=str(interaction.user.id), inline=True)
         embed.add_field(name="Channel", value=f"#{interaction.channel.name}" if interaction.channel else "DM", inline=True)
         embed.add_field(name="Server", value=interaction.guild.name if interaction.guild else "N/A", inline=True)
         embed.set_footer(text=f"Report ID: {interaction.id}")
-        dev_role = discord.utils.get(interaction.guild.roles, name="Bot Developer")
+        
+        # UPDATED: Changed from "Bot Developer" to "Bot Dev"
+        dev_role = discord.utils.get(interaction.guild.roles, name="Bot Dev")
         if not dev_role:
-            await interaction.followup.send("⚠️ Error: Bot Developer role not found. Please contact an administrator.", ephemeral=True)
+            await interaction.followup.send("⚠️ Error: Bot Dev role not found. Please contact an administrator.", ephemeral=True)
             return
+        
         developers = [m for m in interaction.guild.members if dev_role in m.roles]
         if not developers:
-            await interaction.followup.send("⚠️ No Bot Developers found to send report to. Please contact an administrator.", ephemeral=True)
+            await interaction.followup.send("⚠️ No Bot Devs found to send report to. Please contact an administrator.", ephemeral=True)
             return
+        
         sent_count, failed_count = 0, 0
         for dev in developers:
             try:
@@ -278,10 +289,12 @@ class BugReportModal(discord.ui.Modal, title="Report a Bug"):
                 sent_count += 1
             except:
                 failed_count += 1
-        response_msg = f"✅ Bug report submitted successfully!\n\nYour report has been sent to {sent_count} Bot Developer(s)."
+        
+        response_msg = f"✅ Bug report submitted successfully!\n\nYour report has been sent to {sent_count} Bot Dev(s)."
         if failed_count > 0:
             response_msg += f"\n⚠️ Could not reach {failed_count} developer(s) (DMs may be closed)."
         response_msg += f"\n\n**Report ID:** `{interaction.id}`\nDevelopers will review your report soon."
+        
         await interaction.followup.send(response_msg, ephemeral=True)
 
 async def update_hunt_message(channel_id, hunt_index):
@@ -540,21 +553,28 @@ async def createweeklyhunts(ctx):
 @bot.command()
 async def bugreport(ctx):
     member_role = discord.utils.get(ctx.guild.roles, name="Member")
-    higher_roles = ['Frontrunner', 'Envoy', 'Strategist', 'GM', 'Quartermaster', 'Administrator', 'Vice Master', 'Bot Developer']
+    # UPDATED: Changed "Bot Developer" to "Bot Dev"
+    higher_roles = ['Frontrunner', 'Envoy', 'Strategist', 'GM', 'Quartermaster', 'Administrator', 'Vice Master', 'Bot Dev']
+    
     if not member_role or (member_role not in ctx.author.roles and not any(discord.utils.get(ctx.guild.roles, name=r) in ctx.author.roles for r in higher_roles)):
         await ctx.send("❌ You need the Member role or above to report bugs.", delete_after=10)
         await ctx.message.delete(delay=10)
         return
+    
     await ctx.message.delete()
+    
     view = discord.ui.View(timeout=60)
     button = discord.ui.Button(label="Open Bug Report Form", style=discord.ButtonStyle.primary, emoji="🐛")
+    
     async def button_callback(interaction: discord.Interaction):
         if interaction.user.id != ctx.author.id:
             await interaction.response.send_message("This button is not for you!", ephemeral=True)
             return
         await interaction.response.send_modal(BugReportModal())
+    
     button.callback = button_callback
     view.add_item(button)
+    
     await ctx.send(f"{ctx.author.mention} Click the button below to submit a bug report:", view=view, delete_after=60)
 
 bot.run(os.getenv("BOT_TOKEN"))
